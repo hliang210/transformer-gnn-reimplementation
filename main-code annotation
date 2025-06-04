@@ -1,0 +1,392 @@
+from Trans_gnn.data                   import *
+from Trans_gnn.utils                  import *
+from Trans_gnn.model                  import *
+from Trans_gnn.pytorch_early_stopping import *
+import os,torch
+
+# ==============================================
+# 数据参数设置部分
+# ==============================================
+parser = argparse.ArgumentParser(description='Transformer-GNN')
+# 运行模式选择
+parser.add_argument('--mode', default='evaluation',
+                    choices=['training','evaluation','cross-validation','CV'],
+                    help='模式选择: evaluation(模型评估), training(训练新模型), cross-validation/CV(交叉验证)')
+# 图编码大小
+parser.add_argument('--graph_size', default='small',choices=['small','large'],
+                    help='邻域大小决定的图编码格式: 12或16')
+# 训练集比例
+parser.add_argument('--train_size',default=0.8, type=float,
+                    help='训练集比例 (默认:0.8)')
+# 批处理大小
+parser.add_argument('--batch',default=64, type=int,
+                    help='实验中使用批处理大小 (默认:128)')
+# 交叉验证折数
+parser.add_argument('--fold',default=10, type=int,
+                    help='交叉验证时的折数 (默认:20)')
+# 预测目标
+parser.add_argument('--target',default='average_voltage',type=str,
+                    help='要训练的目标变量')
+# 学习率和gamma参数
+parser.add_argument('--learning_rate',default=0.0005,type=float)
+parser.add_argument('--gamma',default=0.98,type=float)
+
+# ==============================================
+# 模型参数设置部分
+# ==============================================
+# AGAT层数
+parser.add_argument('--layers',default=3, type=int,
+                    help='模型中使用的AGAT层数 (默认:3)')
+# 每层神经元数
+parser.add_argument('--neurons',default=64, type=int,
+                    help='每AGAT层的神经元数 (默认:64)')
+# 注意力头数
+parser.add_argument('--heads',default=4, type=int,
+                    help='每AGAT层的注意力头数 (默认:4)')
+# Dropout率
+parser.add_argument('--dropout_rate',default=0.6,type=float)
+# Top-k比率
+parser.add_argument('--top_k_ratio',default=0.8,type=float)
+# 每n层应用top-k
+parser.add_argument('--top_k_every_n',default=3,type=int)
+# 是否使用自定义模型
+parser.add_argument('--custom', action='store_false', help ='使用自定义反应训练模型')
+
+args = parser.parse_args(sys.argv[1:])
+
+# ==============================================
+# 早期停止初始化
+# ==============================================
+early_stopping = EarlyStopping(patience=40, increment=1e-6,verbose=True,target=args.target)
+
+# ==============================================
+# 通用设置与初始化
+# ==============================================
+# 随机种子设置
+random_num = 42
+random.seed(random_num)
+np.random.seed(random_num) 
+
+# 设备设置 (GPU/CPU)
+gpu_id = 7
+device = torch.device(f'cuda:{gpu_id}' if torch.cuda.is_available() else 'cpu')
+
+# 损失函数 (均方误差)
+criterion = nn.MSELoss().to(device)
+
+# 评估指标函数 (平均绝对误差)
+funct = torch_MAE
+metrics = METRICS(f'{args.target}',criterion,funct,device)
+
+# 训练参数
+num_epochs = 1000  # 总训练轮数
+lr = args.learning_rate  # 学习率
+train_param = {'batch_size':args.batch, 'shuffle': True}  # 训练数据加载参数
+valid_param = {'batch_size':args.batch, 'shuffle': False}  # 验证数据加载参数
+
+# ==============================================
+# 数据准备部分
+# ==============================================
+src_CIFS = './DATA/CIFS/CIFS-F/'  # 数据源路径
+df = get_dataset(src_CIFS,args.target)  # 获取数据集
+idx_list = list(range(len(df)))  # 索引列表
+random.shuffle(idx_list)  # 打乱索引
+
+# 数据标准化器
+NORMALIZER = DATA_normalizer(df[f'{args.target}'].values)
+norm = 'bel'  # 标准化方法 ('bel'或其他)
+
+# ==============================================
+# 模型初始化部分
+# ==============================================
+# 根据图大小设置半径搜索参数
+if args.graph_size == 'small':
+    RSM = {'radius':8,'step':0.2,'max_num_nbr':12}  # 小图参数
+else:
+    RSM = {'radius':4,'step':0.5,'max_num_nbr':16}  # 大图参数
+
+# 创建晶体数据集
+CRYSTAL_DATA = CIF_Dataset(df,root_dir=src_CIFS,**RSM)
+
+# ==============================================
+# 神经网络模型构建
+# ==============================================
+if args.mode in ['training','evaluation']:
+    # 创建两个TransformerGNN实例
+    gnn1 = TransformerGNN(args.heads, neurons=args.neurons, nl=args.layers, neighborHood=args.graph_size,
+                         dropout_rate=args.dropout_rate, top_k_ratio=args.top_k_ratio, top_k_every_n=args.top_k_every_n)
+    gnn2 = TransformerGNN(args.heads, neurons=args.neurons, nl=args.layers, neighborHood=args.graph_size,
+                         dropout_rate=args.dropout_rate, top_k_ratio=args.top_k_ratio, top_k_every_n=args.top_k_every_n)
+    
+    # 创建反应预测模型
+    model = REACTION_PREDICTOR(args.neurons*2, gnn1, gnn2, neurons=args.neurons).to(device)
+
+# ==============================================
+# 训练模式
+# ==============================================
+if args.mode == 'training':
+    # 划分训练集、验证集
+    train_idx, test_val = train_test_split(idx_list, train_size=args.train_size, random_state=random_num)
+    _, val_idx = train_test_split(test_val, test_size=0.5, random_state=random_num)
+    
+    # 创建数据集加载器
+    training_set1 = CIF_Lister(train_idx, CRYSTAL_DATA, NORMALIZER, norm, df=df, src=args.graph_size)
+    training_set2 = CIF_Lister(train_idx, CRYSTAL_DATA, NORMALIZER, norm, df=df, src=args.graph_size, id_01=1)
+    validation_set1 = CIF_Lister(val_idx, CRYSTAL_DATA, NORMALIZER, norm, df=df, src=args.graph_size)
+    validation_set2 = CIF_Lister(val_idx, CRYSTAL_DATA, NORMALIZER, norm, df=df, src=args.graph_size, id_01=1)
+    
+    # 创建数据加载器
+    train_loader1 = torch_DataLoader(dataset=training_set1, **train_param)
+    train_loader2 = torch_DataLoader(dataset=training_set2, **train_param)
+    
+    # 优化器和学习率调度器
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=0.005)
+    scheduler = lr_scheduler.ExponentialLR(optimizer, gamma=args.gamma)
+    
+    valid_loader1 = torch_DataLoader(dataset=validation_set1, **valid_param)
+    valid_loader2 = torch_DataLoader(dataset=validation_set2, **valid_param)
+    
+    # 训练循环
+    for epoch in range(num_epochs):
+        # 训练阶段
+        model.train()       
+        start_time = time.time()
+        metrics, model = train(model, train_loader1, train_loader2, metrics, optimizer, device)
+        metrics.reset_parameters('training', epoch)
+        
+        # 验证阶段
+        model.eval()
+        metrics, model, _ = evaluate(model, valid_loader1, valid_loader2, metrics, device)
+        metrics.reset_parameters('validation', epoch)
+        scheduler.step()  # 更新学习率
+        
+        end_time = time.time()
+        e_time = end_time - start_time
+        metrics.save_time(e_time)
+        
+        # 早期停止检查
+        early_stopping(metrics.valid_loss2[epoch], model)
+        flag_value = early_stopping.flag_value + '_'*(22 - len(early_stopping.flag_value))
+        if early_stopping.FLAG == True:
+            estop_val = flag_value
+        else:
+            estop_val = '@best: saving model...'
+            best_epoch = epoch + 1
+        
+        output_training(metrics, epoch, estop_val, f'{e_time:.1f} sec.')
+        
+        if early_stopping.early_stop:
+            print("> Early stopping")
+            break
+    
+    # 保存模型和结果
+    print(f"> DONE TRAINING !")
+    shutil.copy2(f'MODEL/{args.target}-checkpoint.pt', 'MODEL/custom-checkpoint.pt')
+    
+    # 评估并反归一化结果
+    _, _, out_labels = evaluate(model, valid_loader1, valid_loader2, metrics, device, with_labels=True)
+    out_labels = [torch.cat(x, -1) for x in out_labels]
+    true_label, pred_label = out_labels
+    
+    # 根据标准化方法反归一化
+    if norm == 'bel':
+        true_label, pred_label = NORMALIZER.denorm(true_label), NORMALIZER.denorm(pred_label)    
+    elif norm == 'log10':
+        true_label, pred_label = NORMALIZER.delog10(true_label), NORMALIZER.denorm(pred_label)
+    
+    true_label, pred_label = true_label.cpu().numpy(), pred_label.cpu().numpy()
+    
+    # 计算评估指标
+    mse = mean_squared_error(true_label, pred_label)
+    mae = mean_absolute_error(true_label, pred_label)
+    r2 = r2_score(true_label, pred_label)
+    
+    # 保存结果和绘图
+    with open('example.txt', 'a') as f:
+        f.write(f"lr:{args.learning_rate} gamma:{args.gamma} mae:{mae} r2:{r2} target:{args.target}\n")
+    
+    params = {
+        'layers': args.layers,
+        'neurons': args.neurons,
+        'heads': args.heads,
+        'dropout_rate': args.dropout_rate,
+        'top_k_ratio': args.top_k_ratio,
+        'top_k_every_n': args.top_k_every_n
+    }
+    parity_plot(true_label, pred_label, loss=mse, R2=r2, target=args.target, **params)
+
+# ==============================================
+# 评估模式
+# ==============================================
+elif args.mode == 'evaluation':
+    model.eval()
+    # 加载预训练模型
+    if args.custom:
+        model.load_state_dict(torch.load(f'MODEL/custom-checkpoint.pt', map_location=device))
+    else:
+        model.load_state_dict(torch.load(f'MODEL/{args.target}.pt', map_location=device))
+    
+    # 创建测试集
+    _, test_val = train_test_split(idx_list, train_size=args.train_size, random_state=random_num)
+    test_idx, _ = train_test_split(test_val, test_size=0.5, random_state=random_num)
+    
+    testing_set1 = CIF_Lister(test_idx, CRYSTAL_DATA, NORMALIZER, norm, df=df, src=args.graph_size)
+    testing_set2 = CIF_Lister(test_idx, CRYSTAL_DATA, NORMALIZER, norm, df=df, src=args.graph_size, id_01=1)
+    
+    test_loader1 = torch_DataLoader(dataset=testing_set1, **valid_param)
+    test_loader2 = torch_DataLoader(dataset=testing_set2, **valid_param)
+    
+    # 评估模型
+    _, _, out_labels = evaluate(model, test_loader1, test_loader2, metrics, device, with_labels=True)
+    
+    # 反归一化结果
+    out_labels = [torch.cat(x, -1) for x in out_labels]
+    true_label, pred_label = out_labels
+    
+    if norm == 'bel':
+        true_label, pred_label = NORMALIZER.denorm(true_label), NORMALIZER.denorm(pred_label)    
+    elif norm == 'log10':
+        true_label, pred_label = NORMALIZER.delog10(true_label), NORMALIZER.denorm(pred_label)    
+    
+    true_label, pred_label = true_label.cpu().numpy(), pred_label.cpu().numpy()
+    
+    # 计算评估指标
+    mse = mean_squared_error(true_label, pred_label)
+    mae = mean_absolute_error(true_label, pred_label)
+    r2 = r2_score(true_label, pred_label)
+    print(r2)
+    
+    # 保存结果和绘图
+    params = {
+        'layers': args.layers,
+        'neurons': args.neurons,
+        'heads': args.heads,
+        'dropout_rate': args.dropout_rate,
+        'top_k_ratio': args.top_k_ratio,
+        'top_k_every_n': args.top_k_every_n
+    }
+    parity_plot(true_label, pred_label, loss=mse, R2=r2, target=args.target, **params)
+    
+    # 将结果保存到文件
+    save_results_to_file(test_idx, CRYSTAL_DATA, pred_label, true_label, args.target)
+
+# ==============================================
+# 交叉验证模式
+# ==============================================
+elif args.mode in ['cross-validation', 'CV']:
+    milestones = [150, 250]  # 学习率调整里程碑
+    k_folds = KFold(n_splits=args.fold, shuffle=True, random_state=random_num)  # K折交叉验证
+    iteration = 1  # 迭代计数器
+    ALL_errors = []  # 存储所有误差
+    
+    # 交叉验证循环
+    for train_val, test_idx in k_folds.split(idx_list):
+        # 每折重新初始化模型
+        gnn1 = TransformerGNN(args.heads, neurons=args.neurons, nl=args.layers, neighborHood=args.graph_size,
+                            dropout_rate=args.dropout_rate, top_k_ratio=args.top_k_ratio, top_k_every_n=args.top_k_every_n)
+        gnn2 = TransformerGNN(args.heads, neurons=args.neurons, nl=args.layers, neighborHood=args.graph_size,
+                            dropout_rate=args.dropout_rate, top_k_ratio=args.top_k_ratio, top_k_every_n=args.top_k_every_n)
+        model = REACTION_PREDICTOR(args.neurons*2, gnn1, gnn2, neurons=args.neurons).to(device)
+        
+        # 重置评估指标和早期停止
+        metrics = METRICS('voltage', criterion, funct, device)
+        early_stopping = EarlyStopping(patience=40, increment=1e-6, verbose=True)
+        
+        print(tabulate([[f'Iteration # {iteration}']], tablefmt='fancy_grid'))
+        
+        # 划分训练集和验证集
+        train_idx, val_idx = train_test_split(train_val, train_size=0.9, random_state=random_num)
+        
+        # 创建数据集
+        training_set1 = CIF_Lister(train_idx, CRYSTAL_DATA, NORMALIZER, norm, df=df, src=args.graph_size)
+        training_set2 = CIF_Lister(train_idx, CRYSTAL_DATA, NORMALIZER, norm, df=df, src=args.graph_size, id_01=1)
+        validation_set1 = CIF_Lister(val_idx, CRYSTAL_DATA, NORMALIZER, norm, df=df, src=args.graph_size)
+        validation_set2 = CIF_Lister(val_idx, CRYSTAL_DATA, NORMALIZER, norm, df=df, src=args.graph_size, id_01=1)
+        
+        # 创建数据加载器
+        train_loader1 = torch_DataLoader(dataset=training_set1, **train_param)
+        train_loader2 = torch_DataLoader(dataset=training_set2, **train_param)
+        
+        # 优化器和学习率调度器
+        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+        scheduler = lr_scheduler.ExponentialLR(optimizer, gamma=args.gamma)
+        
+        valid_loader1 = torch_DataLoader(dataset=validation_set1, **valid_param)
+        valid_loader2 = torch_DataLoader(dataset=validation_set2, **valid_param)
+        
+        # 训练阶段
+        for epoch in range(num_epochs):
+            model.train()
+            start_time = time.time()
+            
+            metrics, model = train(model, train_loader1, train_loader2, metrics, optimizer, device)
+            metrics.reset_parameters('training', epoch)
+            
+            # 验证阶段
+            model.eval()
+            metrics, model, _ = evaluate(model, valid_loader1, valid_loader2, metrics, device)
+            metrics.reset_parameters('validation', epoch)
+            scheduler.step()
+            
+            end_time = time.time()
+            e_time = end_time - start_time
+            metrics.save_time(e_time)
+            
+            # 早期停止检查
+            early_stopping(metrics.valid_loss2[epoch], model)
+            flag_value = early_stopping.flag_value + '_'*(22 - len(early_stopping.flag_value))
+            if early_stopping.FLAG == True:
+                estop_val = flag_value
+            else:
+                estop_val = '@best: saving model...'
+                best_epoch = epoch + 1
+            
+            output_training(metrics, epoch, estop_val, f'{e_time:.1f} sec.')
+            
+            if early_stopping.early_stop:
+                print("> Early stopping")
+                break
+        
+        # 评估阶段
+        model.eval()
+        model.load_state_dict(torch.load(f'MODEL/{args.target}-checkpoint.pt', map_location=device))
+        
+        # 创建测试集
+        testing_set1 = CIF_Lister(test_idx, CRYSTAL_DATA, NORMALIZER, norm, df=df, src=args.graph_size)
+        testing_set2 = CIF_Lister(test_idx, CRYSTAL_DATA, NORMALIZER, norm, df=df, src=args.graph_size, id_01=1)
+        
+        test_loader1 = torch_DataLoader(dataset=testing_set1, **valid_param)
+        test_loader2 = torch_DataLoader(dataset=testing_set2, **valid_param)
+        
+        # 评估模型
+        _, _, out_labels = evaluate(model, test_loader1, test_loader2, metrics, device, with_labels=True)
+        
+        # 反归一化结果
+        out_labels = [torch.cat(x, -1) for x in out_labels]
+        true_label, pred_label = out_labels
+        true_label, pred_label = NORMALIZER.denorm(true_label), NORMALIZER.denorm(pred_label)
+        true_label, pred_label = true_label.cpu().numpy(), pred_label.cpu().numpy()
+        
+        # 计算评估指标并绘图
+        mse = mean_squared_error(true_label, pred_label)
+        params = {
+            'layers': args.layers,
+            'neurons': args.neurons,
+            'heads': args.heads,
+            'dropout_rate': args.dropout_rate,
+            'top_k_ratio': args.top_k_ratio,
+            'top_k_every_n': args.top_k_every_n
+        }
+        r2 = r2_score(true_label, pred_label)
+        parity_plot(true_label, pred_label, loss=mse, R2=r2, target=args.target, **params)
+        
+        # 保存结果
+        save_results_to_file(test_idx, CRYSTAL_DATA, pred_label, true_label, args.target, idx_k_fold=f'{iteration}-')
+        ALL_errors.append(mse)
+        iteration += 1
+    
+    # 计算并打印交叉验证平均误差
+    mean_kfold_error = np.mean(ALL_errors)
+    std_kfold_error = np.std(ALL_errors)
+    print(ALL_errors)
+    print(f'avg. error: {mean_kfold_error} +/- {std_kfold_error}')
