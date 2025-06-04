@@ -1,0 +1,171 @@
+import torch, numpy as np
+import torch.optim as optim
+from   torch.optim import lr_scheduler 
+from   torch.nn import Linear, Dropout, Parameter, ModuleList, BatchNorm1d
+import torch.nn.functional as F 
+import torch.nn as nn
+
+from torch_geometric.nn.conv  import MessagePassing,TransformerConv,GINEConv
+from torch_geometric.utils    import softmax
+from torch_geometric.nn       import global_add_pool as gdp
+from torch_geometric.nn.inits import glorot, zeros
+
+from torch_geometric.nn import TopKPooling
+from torch_geometric.nn import global_mean_pool as gap, global_max_pool as gmp
+torch.cuda.empty_cache()  # 清空CUDA缓存，防止内存溢出
+
+class COMPOSITION_Attention(torch.nn.Module):
+    """组成注意力机制模块，用于计算节点重要性权重"""
+    def __init__(self, neurons):
+        super(COMPOSITION_Attention, self).__init__()
+        # 定义网络层
+        self.node_layer1 = Linear(neurons+103, 32)  # 输入: 节点特征+全局特征(103维)
+        self.atten_layer = Linear(32, 1)  # 输出单值注意力权重
+        
+    def forward(self, x, batch, global_feat):
+        # 计算每个图的节点数
+        counts = torch.unique(batch, return_counts=True)[-1]
+        # 将全局特征复制到每个节点
+        graph_embed = torch.repeat_interleave(global_feat, counts, dim=0)
+        # 拼接节点特征和全局特征
+        chunk = torch.cat([x, graph_embed], dim=-1)
+        # 通过神经网络计算注意力权重
+        x = F.softplus(self.node_layer1(chunk))  # 使用softplus激活函数
+        x = self.atten_layer(x)
+        # 对每个图的节点权重做softmax归一化
+        weights = softmax(x, batch)
+        return weights
+
+class TransformerGNN(torch.nn.Module):
+    """基于Transformer的图神经网络主模型"""
+    def __init__(self, heads, neurons=64, nl=3, xtra_layers=True,
+                 concat_comp=False, neighborHood='small',
+                 dropout_rate=0.5, top_k_ratio=0.5, top_k_every_n=2):
+        super(TransformerGNN, self).__init__()
+        
+        # 模型参数初始化
+        self.n_heads = heads       # 注意力头数
+        self.n_layers = nl         # 网络层数
+        self.concat_comp = concat_comp  # 是否拼接组成特征
+        self.additional = xtra_layers   # 是否使用额外线性层
+        
+        n_h, n_hX2 = neurons, neurons*2
+        self.neurons = neurons
+        self.neg_slope = 0.2       # LeakyReLU负斜率
+        
+        # 输入特征嵌入层
+        self.embed_n = Linear(92, n_h)  # 节点特征嵌入(原始特征92维)
+        # 边特征嵌入(根据邻域大小选择不同输入维度)
+        self.embed_e = Linear(41, n_h) if neighborHood == 'small' else Linear(9, n_h)
+        self.embed_comp = Linear(103, n_h)  # 组成特征嵌入
+        
+        # 图池化相关参数
+        self.dropout_rate = dropout_rate
+        self.top_k_ratio = top_k_ratio    # 池化保留节点的比例
+        self.top_k_every_n = top_k_every_n  # 每隔几层进行一次池化
+        
+        # 网络层模块列表
+        self.conv_layers = ModuleList([])   # 图卷积层
+        self.lin_layers = ModuleList([])    # 线性层
+        self.pooling_layers = ModuleList([])  # 池化层
+        self.bn_layers = ModuleList([])     # 批归一化层
+        
+        # 构建网络层
+        for i in range(self.n_layers):
+            self.conv_layers.append(TransformerGNN(n_h, n_h))  # 注意: 这里可能有误，应该是TransformerConv?
+            self.lin_layers.append(Linear(n_h, n_h))
+            self.bn_layers.append(BatchNorm1d(n_h))
+            # 定期添加TopK池化层
+            if i % top_k_every_n == 0:
+                self.pooling_layers.append(TopKPooling(n_h, ratio=top_k_ratio))
+        
+        # 组成注意力模块
+        self.comp_atten = COMPOSITION_Attention(n_h)
+        
+        # 根据是否拼接组成特征确定回归头输入维度
+        reg_h = n_hX2 if self.concat_comp else n_h
+        
+        # 可选的两个额外线性层
+        if self.additional:
+            self.linear1 = nn.Linear(reg_h, reg_h)
+            self.linear2 = nn.Linear(reg_h, reg_h)
+        
+        # 输出前的线性层
+        self.linear1 = Linear(n_h, n_h)
+        self.linear2 = Linear(n_h, n_h)
+        self.linear3 = Linear(n_h * 3, n_h)  # 拼接三种池化结果
+
+    def forward(self, x, edge_index, edge_attr, batch, global_feat, cluster):
+        """前向传播过程"""
+        # 初始特征嵌入
+        x = self.embed_n(x)  # 节点特征嵌入
+        edge_attr = F.leaky_relu(self.embed_e(edge_attr), self.neg_slope)  # 边特征嵌入
+        
+        # 通过各网络层
+        for i in range(self.n_layers):
+            x = self.conv_layers[i](x, edge_index)  # 图卷积
+            x = torch.relu(self.lin_layers[i](x))   # 线性变换+激活
+            x = self.bn_layers[i](x)               # 批归一化
+            x = F.softplus(x)                      # 激活函数
+            
+            # 定期进行TopK池化
+            if i % self.top_k_every_n == 0 or i == self.n_layers:
+                x, edge_index, edge_attr, batch, _, _ = self.pooling_layers[int(i / self.top_k_every_n)](
+                    x, edge_index, edge_attr, batch
+                )
+       
+        # 应用组成注意力机制
+        ag = self.comp_atten(x, batch, global_feat)
+        x = (x) * ag  # 用注意力权重调整节点特征
+
+        # 全局池化(求和)
+        x = gdp(x, batch).unsqueeze(1).squeeze()
+        
+        return x
+
+class REACTION_PREDICTOR(torch.nn.Module):
+    """反应预测模型，组合两个GNN处理反应物和产物"""
+    def __init__(self, inp_dim, module1, module2, neurons=64):
+        super(REACTION_PREDICTOR, self).__init__()
+        self.neurons = neurons
+        self.neg_slope = 0.2  # LeakyReLU负斜率
+        
+        # 两个GNN模块(通常一个处理反应物，一个处理产物)
+        self.gnn0 = module1
+        self.gnn1 = module2
+        
+        # 预测头网络层
+        self.layer1 = Linear(inp_dim, neurons)
+        self.layer2 = Linear(neurons, neurons)
+        self.output = Linear(neurons, 1)  # 输出单值预测结果
+
+    def forward(self, data0, data1):
+        """前向传播
+        data0: 反应物图数据
+        data1: 产物图数据
+        """
+        # 解包图数据
+        x0, x1 = data0.x, data1.x
+        edge_index0, edge_index1 = data0.edge_index, data1.edge_index
+        edge_attr0, edge_attr1 = data0.edge_attr, data1.edge_attr
+        batch0, batch1 = data0.batch, data1.batch
+        global_feat0, global_feat1 = data0.global_feature, data1.global_feature
+        cluster0, cluster1 = data0.cluster, data1.cluster
+        
+        # 分别通过两个GNN获取嵌入
+        Embedding0 = self.gnn0(x0, edge_index0, edge_attr0, batch0, global_feat0, cluster0)
+        Embedding1 = self.gnn1(x1, edge_index1, edge_attr1, batch1, global_feat1, cluster1)
+        
+        # 拼接两个嵌入
+        x = torch.cat([Embedding0, Embedding1], dim=-1)
+        
+        # 通过预测头网络
+        x = F.leaky_relu(self.layer1(x), self.neg_slope)
+        x = F.dropout(x, p=0.3, training=self.training)
+        
+        x = F.leaky_relu(self.layer2(x), self.neg_slope)
+        x = F.dropout(x, p=0.3, training=self.training)
+        
+        # 输出预测结果
+        y = F.leaky_relu(self.output(x), self.neg_slope).squeeze()
+        return y
