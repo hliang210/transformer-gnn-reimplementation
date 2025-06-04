@@ -11,3 +11,13 @@ A reimplementation of Employing Graph Neural Networks for Predicting Electrode A
 - ## Motivation
 For better understanding.
 
+**package need:**
+matplotlib
+numpy
+pandas
+pymatgen
+scikit_learn
+seaborn
+tabulate
+torch-geometric
+torch
