@@ -1,0 +1,403 @@
+import numpy as np
+import pandas as pd 
+import functools
+import torch
+import pickle
+from torch.utils.data import Dataset
+from torch_geometric.data import Dataset as torch_Dataset
+from torch_geometric.data import Data, DataLoader as torch_DataLoader
+import sys,json,os
+from pymatgen.core.structure import Structure
+from pymatgen.core.periodic_table import Element
+
+from sklearn.cluster import KMeans
+from sklearn.cluster import SpectralClustering as SPCL
+import warnings
+
+if not sys.warnoptions:
+    warnings.simplefilter("ignore")
+
+class ELEM_Encoder:
+    """元素组成编码器，用于将化学组成转换为向量表示"""
+    def __init__(self):
+        # 包含所有可能元素的列表
+        self.elements = ['H', 'He', 'Li', 'Be', 'B', 'C', 'N', 'O', 'F', 'Ne', 'Na', 'Mg', 'Al', 'Si', 'P', 'S', 'Cl', 'Ar', 'K', 
+                        'Ca', 'Sc', 'Ti', 'V', 'Cr', 'Mn', 'Fe', 'Co', 'Ni', 'Cu', 'Zn', 'Ga', 'Ge', 'As', 'Se', 'Br', 'Kr', 'Rb',
+                        'Sr', 'Y', 'Zr', 'Nb', 'Mo', 'Tc', 'Ru', 'Rh', 'Pd', 'Ag', 'Cd', 'In', 'Sn', 'Sb', 'Te', 'I', 'Xe', 'Cs', 
+                        'Ba', 'La', 'Ce', 'Pr', 'Nd', 'Pm', 'Sm', 'Eu', 'Gd', 'Tb', 'Dy', 'Ho', 'Er', 'Tm', 'Yb', 'Lu', 'Hf', 'Ta', 
+                        'W', 'Re', 'Os', 'Ir', 'Pt', 'Au', 'Hg', 'Tl', 'Pb', 'Bi', 'Po', 'At', 'Rn', 'Fr', 'Ra', 'Ac', 'Th', 'Pa', 
+                        'U', 'Np', 'Pu', 'Am', 'Cm', 'Bk', 'Cf', 'Es', 'Fm', 'Md', 'No', 'Lr']
+        self.e_arr = np.array(self.elements)
+
+    def encode(self, composition_dict):
+        """基于原子数量的组成编码"""
+        answer = [0]*len(self.elements)
+        elements = [str(i) for i in composition_dict.keys()]
+        counts = [j for j in composition_dict.values()]
+        total = sum(counts)  # 原子总数
+
+        for idx in range(len(elements)):
+            elem = elements[idx]
+            ratio = counts[idx]/total  # 计算原子比例
+            idx_e = self.elements.index(elem)
+            answer[idx_e] = ratio
+        return torch.tensor(answer).float().view(1,-1)
+
+    def encode2(self, composition_dict):
+        """基于原子质量的组成编码"""
+        answer = [0]*len(self.elements)
+        elements = [Element(str(i)) for i in composition_dict.keys()]
+        counts = [j for j in composition_dict.values()]
+        weight = [elements[i].atomic_mass*counts[i] for i in range(len(elements))]
+        total = sum(weight)  # 总质量
+
+        for idx in range(len(elements)):
+            elem = elements[idx].symbol
+            ratio = weight[idx]/total  # 计算质量比例
+            idx_e = self.elements.index(elem)
+            answer[idx_e] = ratio
+        return torch.tensor(answer).float().view(1,-1)
+
+    def decode_pymatgen_num(self, tensor_idx):
+        """从原子序数解码元素符号"""
+        idx = (tensor_idx-1).cpu().tolist()
+        return self.e_arr[idx]
+
+class DATA_normalizer:
+    """数据标准化器，支持多种标准化方法"""
+    def __init__(self, array):
+        tensor = torch.tensor(array)
+        self.range = torch.max(tensor) - torch.min(tensor)
+        self.min = torch.min(tensor)
+        self.mean = torch.mean(tensor)
+        self.std = torch.std(tensor)
+        
+    def reg(self, x):
+        """原始值"""
+        return x.float()
+
+    def log10(self, x):
+        """对数变换"""
+        return torch.log10(x)
+
+    def delog10(self, x):
+        """逆对数变换"""
+        return 10**x
+
+    def norm(self, x):
+        """Z-score标准化"""
+        return (x - self.mean) / self.std
+
+    def denorm(self, x):
+        """Z-score逆变换"""
+        return x * self.std + self.mean
+    
+    def norm0_1(self, x):
+        """0-1范围标准化"""
+        return (x - self.min)/self.range
+    
+    def denorm0_1(self, x):
+        """0-1范围逆变换"""
+        return x*self.range + self.min
+
+class METRICS:
+    """训练指标跟踪器"""
+    def __init__(self, c_property, torch_criterion, torch_func, device):
+        self.c_property = c_property  # 目标属性名称
+        self.criterion = torch_criterion  # 损失函数(如MSE)
+        self.eval_func = torch_func  # 评估函数(如MAE)
+        self.dv = device  # 计算设备
+        
+        # 初始化跟踪指标
+        self.training_measure1 = torch.tensor(0.0).to(device)
+        self.training_measure2 = torch.tensor(0.0).to(device)
+        self.valid_measure1 = torch.tensor(0.0).to(device)
+        self.valid_measure2 = torch.tensor(0.0).to(device)
+
+        self.training_counter = 0  # 训练样本计数
+        self.valid_counter = 0  # 验证样本计数
+
+        # 历史记录
+        self.training_loss1 = []  # 训练损失1
+        self.training_loss2 = []  # 训练损失2
+        self.valid_loss1 = []  # 验证损失1
+        self.valid_loss2 = []  # 验证损失2
+        self.duration = []  # 训练时长
+        self.dataframe = self.to_frame()  # 转为DataFrame
+
+    def __str__(self):
+        """字符串表示"""
+        return self.to_frame().to_string()
+
+    def to_frame(self):
+        """转换为DataFrame格式"""
+        metrics_df = pd.DataFrame(list(zip(self.training_loss1, self.training_loss2,
+                                         self.valid_loss1, self.valid_loss2, self.duration)),
+                                columns=['training_1', 'training_2', 'valid_1', 'valid_2', 'time'])
+        return metrics_df
+
+    def save_time(self, e_duration):
+        """保存时间信息"""
+        self.duration.append(e_duration)
+
+    def __call__(self, which_phase, tensor_pred, tensor_true, measure=1):
+        """
+        计算指标
+        which_phase: 'training'或'validation'
+        measure: 1使用criterion, 2使用eval_func
+        """
+        if measure == 1:
+            loss = self.criterion(tensor_pred, tensor_true)
+            if which_phase == 'training':
+                self.training_measure1 += loss
+            elif which_phase == 'validation':
+                self.valid_measure1 += loss
+        else:
+            loss = self.eval_func(tensor_pred, tensor_true)
+            if which_phase == 'training':
+                self.training_measure2 += loss
+            elif which_phase == 'validation':
+                self.valid_measure2 += loss
+        return loss
+
+    def reset_parameters(self, which_phase, epoch):
+        """重置指标并保存历史记录"""
+        if which_phase == 'training':
+            # 计算平均值
+            t1 = self.training_measure1/(self.training_counter)
+            t2 = self.training_measure2/(self.training_counter)
+
+            self.training_loss1.append(t1.item())
+            self.training_loss2.append(t2.item())
+            # 重置计数器
+            self.training_measure1 = torch.tensor(0.0).to(self.dv)
+            self.training_measure2 = torch.tensor(0.0).to(self.dv)
+            self.training_counter = 0 
+        else:
+            # 计算验证集平均值
+            v1 = self.valid_measure1/(self.valid_counter)
+            v2 = self.valid_measure2/(self.valid_counter)
+
+            self.valid_loss1.append(v1.item())
+            self.valid_loss2.append(v2.item())
+            self.valid_measure1 = torch.tensor(0.0).to(self.dv)
+            self.valid_measure2 = torch.tensor(0.0).to(self.dv)      
+            self.valid_counter = 0 
+
+    def save_info(self):
+        """保存指标信息到文件"""
+        with open('MODELS/metrics_.pickle', 'wb') as metrics_file:
+            pickle.dump(self, metrics_file)
+
+class GaussianDistance:
+    """高斯距离扩展，将距离转换为高斯分布特征"""
+    def __init__(self, dmin, dmax, step, var=None):
+        assert dmin < dmax
+        assert dmax - dmin > step
+        self.filter = np.arange(dmin, dmax+step, step)  # 距离区间划分
+        self.var = var if var is not None else step  # 方差
+
+    def expand(self, distances):
+        """将距离值扩展为高斯分布特征"""
+        return np.exp(-(distances[..., np.newaxis] - self.filter)**2 / self.var**2)
+
+class AtomInitializer:
+    """原子特征初始化基类"""
+    def __init__(self, atom_types):
+        self.atom_types = set(atom_types)  # 原子类型集合
+        self._embedding = {}  # 原子特征字典
+
+    def get_atom_fea(self, atom_type):
+        """获取原子特征"""
+        assert atom_type in self.atom_types
+        return self._embedding[atom_type]
+
+    def load_state_dict(self, state_dict):
+        """加载预训练特征"""
+        self._embedding = state_dict
+        self.atom_types = set(self._embedding.keys())
+        self._decodedict = {idx: atom_type for atom_type, idx in self._embedding.items()}
+
+    def state_dict(self):
+        """获取特征字典"""
+        return self._embedding
+
+    def decode(self, idx):
+        """从索引解码原子类型"""
+        if not hasattr(self, '_decodedict'):
+            self._decodedict = {idx: atom_type for atom_type, idx in self._embedding.items()}
+        return self._decodedict[idx]
+
+class AtomCustomJSONInitializer(AtomInitializer):
+    """从JSON文件初始化原子特征"""
+    def __init__(self, elem_embedding_file):
+        with open(elem_embedding_file) as f:
+            elem_embedding = json.load(f)
+        elem_embedding = {int(key): value for key, value in elem_embedding.items()}
+        super(AtomCustomJSONInitializer, self).__init__(elem_embedding.keys())
+        for key, value in elem_embedding.items():
+            self._embedding[key] = np.array(value, dtype=float)
+
+class CIF_Lister(Dataset):
+    """晶体数据加载器，将CIF数据转换为PyG的Data对象"""
+    def __init__(self, crystals_ids, full_dataset, norm_obj=None, normalization=None, df=None, src=None, id_01=0):
+        self.crystals_ids = crystals_ids  # 晶体ID列表
+        self.full_dataset = full_dataset  # 完整数据集
+        self.normalizer = norm_obj  # 标准化器
+        self.normalization = normalization  # 标准化方法
+        self.src = src  # 数据源标识
+        self.HighLow_id = id_01  # 高低标识(0或1)
+        self.oneHot_ion = self.oneHot_iontype()  # 离子类型one-hot编码
+        
+    def oneHot_iontype(self):
+        """离子类型one-hot编码"""
+        ionType = ['Al', 'Ca', 'Cs', 'K', 'Li', 'Mg', 'Na', 'Rb', 'Y', 'Zn']
+        oneHotMatrix = torch.eye(len(ionType)).float()
+        return {ionType[i]: oneHotMatrix[i].view(1,-1) for i in range(len(ionType))}
+    
+    def __len__(self):
+        return len(self.crystals_ids)
+
+    def __getitem__(self, idx):
+        """获取单个晶体数据并转换为PyG的Data对象"""
+        i = self.crystals_ids[idx]
+        materialLowHigh = self.full_dataset[i]  # 获取原始数据
+
+        def organizeDATA(material):
+            """组织数据为模型输入格式"""
+            n_features = material[0][0]  # 节点特征
+            e_features = material[0][1]  # 边特征
+            e_features = e_features.view(-1,41) if self.src =='small' else e_features.view(-1,9)
+            a_matrix = material[0][2]  # 邻接矩阵
+
+            groups = material[1]  # 原子聚类分组
+            enc_compo = material[2]  # 组成编码
+            coordinates = material[3]  # 原子坐标
+            y = material[4]  # 目标值
+            stringIon = material[-1]  # 离子类型
+
+            # 根据指定方法标准化目标值
+            if self.normalization == None: y = y
+            elif self.normalization == '0-1': y = self.normalizer.norm0_1(y)
+            elif self.normalization == 'log': y = self.normalizer.log10(y)
+            elif self.normalization == 'bel': y = self.normalizer.norm(y)
+            elif self.normalization == 'classification-1': 
+                y = torch.tensor([0]).long() if y == 0 else torch.tensor([1]).long()
+            elif self.normalization == 'classification-0': 
+                y = torch.tensor([1]).long() if y == 0 else torch.tensor([0]).long()  
+            
+            return (n_features, y, e_features, a_matrix, enc_compo, groups, 
+                    torch.tensor([len(n_features)]).float(), coordinates, 
+                    torch.tensor([float(i)]), self.oneHot_ion[stringIon])
+
+        material = organizeDATA(materialLowHigh[self.HighLow_id])
+        # 构建PyG的Data对象
+        graph_crystal = Data(
+            x=material[0], y=material[1],  # 节点特征和目标
+            edge_attr=material[2], edge_index=material[3],  # 边特征和邻接索引
+            global_feature=material[4], cluster=material[5],  # 全局特征和聚类
+            num_atoms=material[6], coords=material[7],  # 原子数和坐标
+            the_idx=material[8]  # 原始索引
+        )
+        return graph_crystal
+
+class CIF_Dataset(Dataset):
+    """晶体数据集，从CIF文件读取并处理晶体结构数据"""
+    def __init__(self, part_data=None, norm_obj=None, normalization=None, 
+                 max_num_nbr=12, radius=8, dmin=0, step=0.2, cls_num=3, 
+                 root_dir='DATA/CIFS/'):
+        self.root_dir = root_dir  # CIF文件目录
+        self.max_num_nbr = max_num_nbr  # 最大邻居数
+        self.radius = radius  # 邻居搜索半径(Å)
+        self.normalizer = norm_obj  # 标准化器
+        self.normalization = normalization  # 标准化方法
+        self.full_data = part_data  # 完整数据
+        # 原子特征初始化器
+        self.ari = AtomCustomJSONInitializer(self.root_dir+'atom_init.json')
+        # 高斯距离扩展器
+        self.gdf = GaussianDistance(dmin=dmin, dmax=self.radius, step=step)
+        # 两种聚类算法(用于原子分组)
+        self.clusterizer = SPCL(n_clusters=cls_num, random_state=None, assign_labels='discretize')
+        self.clusterizer2 = KMeans(n_clusters=cls_num, random_state=None)
+        self.encoder_elem = ELEM_Encoder()  # 元素编码器
+        self.update_root = None
+
+    def __len__(self):
+        return len(self.partial_data)
+
+    @functools.lru_cache(maxsize=None)  # 缓存加载的结构
+    def __getitem__(self, idx):
+        """获取一对晶体结构(反应物和产物)"""
+        cif_id1, cif_id2, label, ionType = self.full_data.iloc[idx]
+        
+        # 从CIF文件加载晶体结构
+        crystal1 = Structure.from_file(os.path.join(self.root_dir, cif_id1+'.cif'))
+        crystal2 = Structure.from_file(os.path.join(self.root_dir, cif_id2+'.cif'))
+        
+        def crystaldata(crystal, label, cif_id, ionType):
+            """处理单个晶体结构数据"""
+            # 获取原子特征
+            atom_fea = np.vstack([self.ari.get_atom_fea(crystal[i].specie.number) 
+                              for i in range(len(crystal))])
+            atom_fea = torch.Tensor(atom_fea)
+            
+            # 获取所有邻居信息
+            all_nbrs = crystal.get_all_neighbors(self.radius, include_index=True)
+            all_nbrs = [sorted(nbrs, key=lambda x: x[1]) for nbrs in all_nbrs]  # 按距离排序
+            
+            # 处理邻居特征和索引
+            nbr_fea_idx, nbr_fea = [], []
+            for nbr in all_nbrs:
+                if len(nbr) < self.max_num_nbr:
+                    # 不足最大邻居数时填充
+                    nbr_fea_idx.append(list(map(lambda x: x[2], nbr)) + 
+                                     [0]*(self.max_num_nbr - len(nbr)))
+                    nbr_fea.append(list(map(lambda x: x[1], nbr)) + 
+                                 [self.radius+1.]*(self.max_num_nbr - len(nbr)))
+                else:
+                    # 截断到最大邻居数
+                    nbr_fea_idx.append(list(map(lambda x: x[2], nbr[:self.max_num_nbr])))
+                    nbr_fea.append(list(map(lambda x: x[1], nbr[:self.max_num_nbr])))
+            nbr_fea_idx, nbr_fea = np.array(nbr_fea_idx), np.array(nbr_fea)
+
+            # 将距离转换为高斯分布特征
+            nbr_fea = self.gdf.expand(nbr_fea)
+            
+            # 原子坐标聚类(用于分组)
+            g_coords = crystal.cart_coords
+            groups = [0]*len(g_coords)
+            if len(g_coords) > 2:
+                try: 
+                    groups = self.clusterizer.fit_predict(g_coords)
+                except: 
+                    groups = self.clusterizer2.fit_predict(g_coords)
+            groups = torch.tensor(groups).long()
+
+            # 转换为张量
+            atom_fea = torch.Tensor(atom_fea)
+            nbr_fea = torch.Tensor(nbr_fea)
+            nbr_fea_idx = self.format_adj_matrix(torch.LongTensor(nbr_fea_idx))
+            target = torch.Tensor([float(label)])
+
+            # 额外信息
+            coordinates = torch.tensor(g_coords) 
+            enc_compo = self.encoder_elem.encode(crystal.composition)
+            return ((atom_fea, nbr_fea, nbr_fea_idx), groups, enc_compo, 
+                    coordinates, target, cif_id, 
+                    [crystal[i].specie for i in range(len(crystal))], ionType)
+        
+        # 处理两个晶体结构
+        structure1 = crystaldata(crystal1, label, cif_id1, ionType)  # 反应物
+        structure2 = crystaldata(crystal2, label, cif_id2, ionType)  # 产物
+        return structure1, structure2
+        
+    def format_adj_matrix(self, adj_matrix):
+        """将邻接矩阵转换为PyG需要的边索引格式"""
+        size = len(adj_matrix)
+        src_list = list(range(size))
+        # 创建源节点索引
+        all_src_nodes = torch.tensor([[x]*adj_matrix.shape[1] for x in src_list]).view(-1).long().unsqueeze(0)
+        # 创建目标节点索引
+        all_dst_nodes = adj_matrix.view(-1).unsqueeze(0)
+        # 合并为[2, num_edges]格式
+        return torch.cat((all_src_nodes, all_dst_nodes), dim=0)
